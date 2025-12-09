@@ -216,31 +216,60 @@ func (dh *DockerHandler) GetContainerInfo(containerID, nodeID string, OwnerInfo 
 // ========================== //
 
 // GetEventChannel Function
-func (dh *DockerHandler) GetEventChannel(ctx context.Context, StopChan <-chan struct{}) <-chan events.Message {
-	if dh.DockerClient != nil {
-		eventBuffer := make(chan events.Message, 256)
+func (dh *DockerHandler) GetEventChannel(ctx context.Context, stopChan <-chan struct{}) <-chan events.Message {
+	if dh.DockerClient == nil {
+		return nil
+	}
 
+	eventBuffer := make(chan events.Message, 256)
+
+	go func() {
+		defer close(eventBuffer)
+
+		// docker.Events returns ( <-chan events.Message, <-chan error )
+		eventStream, errChan := dh.DockerClient.Events(ctx, events.ListOptions{})
+
+		// consuming error channel into another goroutine
 		go func() {
-
-			eventStream, _ := dh.DockerClient.Events(ctx, events.ListOptions{})
-			defer close(eventBuffer)
-
-			for event := range eventStream {
-				select {
-				case eventBuffer <- event:
-				case <-ctx.Done():
-					return
-				case <-StopChan:
-					return
-				default:
-					kg.Warnf("Docker channel full.")
-				}
+			if errChan == nil {
+				return
+			}
+			if e, ok := <-errChan; ok && e != nil {
+				kg.Warnf("Docker events stream error: %s", e.Error())
 			}
 		}()
 
-		return eventBuffer
-	}
-	return nil
+		for {
+			select {
+			case ev, ok := <-eventStream:
+				if !ok {
+					kg.Print("Docker event channel closed, stopping Docker event monitor")
+					return
+				}
+
+				// yaha par bhi context / StopChan respect kar rahe hain
+				select {
+				case eventBuffer <- ev:
+				case <-ctx.Done():
+					kg.Print("Docker event monitor exiting due to context cancellation")
+					return
+				case <-stopChan:
+					kg.Print("Docker event monitor exiting due to StopChan")
+					return
+				}
+
+			case <-ctx.Done():
+				kg.Print("Docker event monitor exiting due to context cancellation (outer)")
+				return
+
+			case <-stopChan:
+				kg.Print("Docker event monitor exiting due to StopChan (outer)")
+				return
+			}
+		}
+	}()
+
+	return eventBuffer
 }
 
 // =================== //
@@ -779,7 +808,7 @@ func (dm *KubeArmorDaemon) UpdateDockerContainer(containerID, action string) {
 }
 
 // MonitorDockerEvents Function
-func (dm *KubeArmorDaemon) MonitorDockerEvents() {
+func (dm *KubeArmorDaemon) MonitorDockerEvents(ctx context.Context) {
 	dm.WgDaemon.Add(1)
 	defer dm.WgDaemon.Done()
 
@@ -795,19 +824,23 @@ func (dm *KubeArmorDaemon) MonitorDockerEvents() {
 
 	dm.Logger.Print("Started to monitor Docker events")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	EventChan := Docker.GetEventChannel(ctx, StopChan)
+	if EventChan == nil {
+		dm.Logger.Warn("Docker event channel is nil, stopping Docker event monitor")
+		return
+	}
 
 	for {
 		select {
-		case <-StopChan:
+		case <-ctx.Done():
+			dm.Logger.Print("Stopping Docker event monitor via context (ctx.Done)")
 			return
 
 		case msg, valid := <-EventChan:
 			if !valid {
-				continue
+				// Events stream closed (e.g. docker daemon down / ctx cancel)
+				dm.Logger.Print("Docker event channel closed, stopping Docker event monitor")
+				return
 			}
 
 			// if message type is container

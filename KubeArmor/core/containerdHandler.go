@@ -634,7 +634,7 @@ func (dm *KubeArmorDaemon) UpdateContainerdContainer(ctx context.Context, contai
 // MonitorContainerdEvents Function
 // Implements a bounded worker-pool that enqueues events and processes them concurrently.
 // Full-parallel mode (no per-container ordering) is used as requested.
-func (dm *KubeArmorDaemon) MonitorContainerdEvents() {
+func (dm *KubeArmorDaemon) MonitorContainerdEvents(ctx context.Context) {
 	dm.WgDaemon.Add(1)
 	defer dm.WgDaemon.Done()
 
@@ -659,6 +659,8 @@ func (dm *KubeArmorDaemon) MonitorContainerdEvents() {
 		defer ticker.Stop()
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-StopChan:
 				return
 			case <-ticker.C:
@@ -707,7 +709,14 @@ func (dm *KubeArmorDaemon) MonitorContainerdEvents() {
 	// Main subscription loop now only enqueues events (backpressure when jobs full)
 	for {
 		select {
+		case <-ctx.Done():
+			dm.Logger.Print("Stopping containerd events monitor via context")
+			// close jobs to stop workers and wait for them (dm.WgDaemon handles waiting)
+			close(jobs)
+			return
+
 		case <-StopChan:
+			dm.Logger.Print("Stopping containerd events monitor via StopChan")
 			// close jobs to stop workers and wait for them (dm.WgDaemon handles waiting)
 			close(jobs)
 			return

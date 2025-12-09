@@ -459,6 +459,9 @@ func (dm *KubeArmorDaemon) SetHealthStatus(serviceName string, healthStatus grpc
 // KubeArmor Function
 func KubeArmor() {
 	// create a daemon
+
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
 	dm := NewKubeArmorDaemon()
 	// Enable KubeArmorHostPolicy for both VM and KVMAgent and in non-k8s env
 	if cfg.GlobalCfg.KVMAgent || (!cfg.GlobalCfg.K8sEnv && cfg.GlobalCfg.HostPolicy) {
@@ -696,7 +699,7 @@ func KubeArmor() {
 				// update already deployed containers
 				dm.GetAlreadyDeployedDockerContainers()
 				// monitor docker events
-				go dm.MonitorDockerEvents()
+				go dm.MonitorDockerEvents(rootCtx)
 			} else if strings.Contains(cfg.GlobalCfg.CRISocket, "containerd") {
 				// insuring NRI monitoring only in case containerd is present
 				if cfg.GlobalCfg.NRIEnabled && dm.checkNRIAvailability() == nil {
@@ -704,7 +707,7 @@ func KubeArmor() {
 					go dm.MonitorNRIEvents()
 				} else {
 					// monitor containerd events
-					go dm.MonitorContainerdEvents()
+					go dm.MonitorContainerdEvents(rootCtx)
 				}
 			} else if strings.Contains(cfg.GlobalCfg.CRISocket, "cri-o") {
 				// monitor crio events
@@ -748,10 +751,10 @@ func KubeArmor() {
 				// update already deployed containers
 				dm.GetAlreadyDeployedDockerContainers()
 				// monitor docker events
-				go dm.MonitorDockerEvents()
+				go dm.MonitorDockerEvents(rootCtx)
 			} else if strings.Contains(dm.Node.ContainerRuntimeVersion, "containerd") || strings.Contains(cfg.GlobalCfg.CRISocket, "containerd") {
 				// monitor containerd events
-				go dm.MonitorContainerdEvents()
+				go dm.MonitorContainerdEvents(rootCtx)
 			} else if strings.Contains(dm.Node.ContainerRuntimeVersion, "cri-o") || strings.Contains(cfg.GlobalCfg.CRISocket, "cri-o") {
 				// monitor crio events
 				go dm.MonitorCrioEvents()
@@ -777,7 +780,7 @@ func KubeArmor() {
 					dm.GetAlreadyDeployedDockerContainers()
 
 					// monitor docker events
-					go dm.MonitorDockerEvents()
+					go dm.MonitorDockerEvents(rootCtx)
 				} else {
 					// we might have to use containerd's socket as docker's socket is not
 					// available
@@ -787,7 +790,7 @@ func KubeArmor() {
 						cfg.GlobalCfg.CRISocket = "unix://" + socketFile
 
 						// monitor containerd events
-						go dm.MonitorContainerdEvents()
+						go dm.MonitorContainerdEvents(rootCtx)
 					} else {
 						dm.Logger.Err("Failed to monitor containers (Docker socket file is not accessible)")
 
@@ -804,7 +807,7 @@ func KubeArmor() {
 					cfg.GlobalCfg.CRISocket = "unix://" + socketFile
 
 					// monitor containerd events
-					go dm.MonitorContainerdEvents()
+					go dm.MonitorContainerdEvents(rootCtx)
 				} else {
 					dm.Logger.Err("Failed to monitor containers (Containerd socket file is not accessible)")
 
@@ -996,8 +999,14 @@ func KubeArmor() {
 	if !cfg.GlobalCfg.CoverageTest {
 		// listen for interrupt signals
 		sigChan := GetOSSigChannel()
-		<-sigChan
-		dm.Logger.Print("Got a signal to terminate KubeArmor")
+
+		go func() {
+			<-sigChan
+			dm.Logger.Print("Got a signal to terminate Kubearmor")
+			rootCancel()
+		}()
+		<-rootCtx.Done()
+
 	}
 
 	// destroy the daemon
