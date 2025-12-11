@@ -6,6 +6,7 @@ package monitor
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -113,14 +114,6 @@ type ContextCombined struct {
 // ======================= //
 // == Container Monitor == //
 // ======================= //
-
-// StopChan Channel
-var StopChan chan struct{}
-
-// init Function
-func init() {
-	StopChan = make(chan struct{})
-}
 
 // SystemMonitor Structure
 type SystemMonitor struct {
@@ -734,7 +727,7 @@ func (mon *SystemMonitor) DestroySystemMonitor() error {
 // ======================= //
 
 // TraceSyscall Function
-func (mon *SystemMonitor) TraceSyscall() {
+func (mon *SystemMonitor) TraceSyscall(ctx context.Context) {
 	if mon.SyscallPerfMap != nil {
 		go func() {
 			for {
@@ -817,7 +810,8 @@ func (mon *SystemMonitor) TraceSyscall() {
 
 	for {
 		select {
-		case <-StopChan:
+		case <-ctx.Done():
+			mon.Logger.Print("TraceSyscall exiting due to context cancellation")
 			return
 
 		case dataRaw, valid := <-mon.SyscallChannel:

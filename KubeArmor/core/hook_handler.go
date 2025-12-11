@@ -4,6 +4,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -23,15 +24,20 @@ const kubearmorDir = "/var/run/kubearmor"
 
 // ListenToHook starts listening on a UNIX socket and waits for container hooks
 // to pass new containers
-func (dm *KubeArmorDaemon) ListenToK8sHook() {
+func (dm *KubeArmorDaemon) ListenToK8sHook(ctx context.Context) {
+	dm.WgDaemon.Add(1)
+	defer dm.WgDaemon.Done()
+
 	dm.Logger.Print("Started to monitor OCI Hook events")
+
 	if err := os.MkdirAll(kubearmorDir, 0750); err != nil {
 		dm.Logger.Warnf("Failed to create ka.sock dir: %v", err)
 	}
 
 	listenPath := filepath.Join(kubearmorDir, "ka.sock")
-	err := os.Remove(listenPath) // in case kubearmor crashed and the socket wasn't removed
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+
+	// cleanup old socket (in case of crash)
+	if err := os.Remove(listenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		dm.Logger.Warnf("Failed to cleanup ka.sock: %v", err)
 	}
 
@@ -40,20 +46,37 @@ func (dm *KubeArmorDaemon) ListenToK8sHook() {
 		dm.Logger.Warnf("Failed listening on ka.sock: %v", err)
 		return
 	}
+	defer func() {
+		_ = socket.Close()
+		if err := os.Remove(listenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			dm.Logger.Warnf("Failed to remove ka.sock on shutdown: %v", err)
+		}
+	}()
 
-	defer socket.Close()
-	defer os.Remove(listenPath)
 	ready := &atomic.Bool{}
+
+	// close the listener when context is cancelled -> unblocks Accept()
+	go func() {
+		<-ctx.Done()
+		dm.Logger.Print("K8s hook listener: context cancelled, closing socket")
+		_ = socket.Close()
+	}()
 
 	for {
 		conn, err := socket.Accept()
 		if err != nil {
+			// if context is done or socket is closed -> exit cleanly
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				dm.Logger.Print("K8s hook listener exiting due to context cancellation")
+				return
+			}
+
 			dm.Logger.Warnf("Error accepting socket connection: %v", err)
+			continue
 		}
 
 		go dm.handleK8sConn(conn, ready)
 	}
-
 }
 
 // handleConn gets container details from container hooks.

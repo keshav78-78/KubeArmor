@@ -166,7 +166,7 @@ func (dm *KubeArmorDaemon) checkAndUpdateNode(item *corev1.Node) {
 }
 
 // WatchK8sNodes Function
-func (dm *KubeArmorDaemon) WatchK8sNodes() {
+func (dm *KubeArmorDaemon) WatchK8sNodes(ctx context.Context) {
 	kg.Printf("GlobalCfg.Host=%s, KUBEARMOR_NODENAME=%s", cfg.GlobalCfg.Host, os.Getenv("KUBEARMOR_NODENAME"))
 
 	nodeName := os.Getenv("KUBEARMOR_NODENAME")
@@ -199,9 +199,13 @@ func (dm *KubeArmorDaemon) WatchK8sNodes() {
 		return
 	}
 
-	go factory.Start(StopChan)
-	factory.WaitForCacheSync(StopChan)
-	kg.Print("Started watching node information")
+		go func() {
+		kg.Print("Node watcher: starting informer")
+		// start + wait using ctx.Done() instead of StopChan
+		factory.Start(ctx.Done())
+		factory.WaitForCacheSync(ctx.Done())
+		kg.Print("Node watcher exiting due to context")
+	}()
 
 }
 
@@ -966,8 +970,8 @@ func (dm *KubeArmorDaemon) handlePodEvent(event string, obj *corev1.Pod) {
 	dm.UpdateEndPointWithPod(event, pod)
 }
 
-// WatchK8sPods Function
-func (dm *KubeArmorDaemon) WatchK8sPods() {
+// WatchK8sPods Function (Phase 2 — context-based shutdown)
+func (dm *KubeArmorDaemon) WatchK8sPods(ctx context.Context) {
 
 	if !kl.IsK8sEnv() {
 		dm.Logger.Print("not in a k8s environment")
@@ -982,37 +986,50 @@ func (dm *KubeArmorDaemon) WatchK8sPods() {
 	nodeFieldSelector := informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
 		opts.FieldSelector = fmt.Sprintf("spec.nodeName=%s", nodeName)
 	})
-	factory := informers.NewSharedInformerFactoryWithOptions(K8s.K8sClient, 0, nodeFieldSelector)
+
+	factory := informers.NewSharedInformerFactoryWithOptions(
+		K8s.K8sClient,
+		0,
+		nodeFieldSelector,
+	)
+
 	informer := factory.Core().V1().Pods().Informer()
 
-	var err error
-	if _, err = informer.AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj any) {
-				if pod, ok := obj.(*corev1.Pod); ok {
-					dm.handlePodEvent(addEvent, pod)
-				}
-			},
-			UpdateFunc: func(_, newObj any) {
-				if pod, ok := newObj.(*corev1.Pod); ok {
-					dm.handlePodEvent(updateEvent, pod)
-				}
-			},
-			DeleteFunc: func(obj any) {
-				if pod, ok := obj.(*corev1.Pod); ok {
-					dm.handlePodEvent(deleteEvent, pod)
-				}
-			},
+	// Register event handlers
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			if pod, ok := obj.(*corev1.Pod); ok {
+				dm.handlePodEvent(addEvent, pod)
+			}
 		},
-	); err != nil {
+		UpdateFunc: func(_, newObj any) {
+			if pod, ok := newObj.(*corev1.Pod); ok {
+				dm.handlePodEvent(updateEvent, pod)
+			}
+		},
+		DeleteFunc: func(obj any) {
+			if pod, ok := obj.(*corev1.Pod); ok {
+				dm.handlePodEvent(deleteEvent, pod)
+			}
+		},
+	})
+
+	if err != nil {
 		dm.Logger.Warnf("Error starting pod informer=%s", err)
 		return
 	}
 
-	go factory.Start(StopChan)
-	dm.Logger.Print("Started watching pod information")
+	// START informer using context-based stop
+	go func() {
+		dm.Logger.Print("Pod watcher: starting shared informer")
+		factory.Start(ctx.Done())              // context replaces StopChan
+		<-ctx.Done()
+		dm.Logger.Print("Pod watcher exiting via context")
+	}()
 
+	dm.Logger.Print("Started watching pod information (ctx-based)")
 }
+
 
 // updateNamespaceListforCSP - in case of NotIn operator for namespace key, a new ns might be added later
 // and here we will update namespaceList for CSP
@@ -1741,7 +1758,7 @@ func (dm *KubeArmorDaemon) CreateSecurityPolicy(policyType string, securityPolic
 }
 
 // WatchSecurityPolicies Function
-func (dm *KubeArmorDaemon) WatchSecurityPolicies() cache.InformerSynced {
+func (dm *KubeArmorDaemon) WatchSecurityPolicies(ctx context.Context) cache.InformerSynced {
 	for {
 		if err := K8s.CheckCustomResourceDefinition("kubearmorpolicies"); err != nil {
 			time.Sleep(time.Second * 1)
@@ -1757,7 +1774,6 @@ func (dm *KubeArmorDaemon) WatchSecurityPolicies() cache.InformerSynced {
 	registration, err := informer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj any) {
-				// create a security policy
 				if policy, ok := obj.(*ksp.KubeArmorPolicy); ok {
 
 					secPolicy, err := dm.CreateSecurityPolicy(KubeArmorPolicy, *policy)
@@ -1765,10 +1781,12 @@ func (dm *KubeArmorDaemon) WatchSecurityPolicies() cache.InformerSynced {
 						dm.Logger.Warnf("Error ADD, %s", err)
 						return
 					}
+
 					dm.SecurityPoliciesLock.Lock()
 					new := true
-					for _, policy := range dm.SecurityPolicies {
-						if policy.Metadata["namespaceName"] == secPolicy.Metadata["namespaceName"] && policy.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
+					for _, p := range dm.SecurityPolicies {
+						if p.Metadata["namespaceName"] == secPolicy.Metadata["namespaceName"] &&
+							p.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
 							new = false
 							break
 						}
@@ -1777,11 +1795,14 @@ func (dm *KubeArmorDaemon) WatchSecurityPolicies() cache.InformerSynced {
 						dm.SecurityPolicies = append(dm.SecurityPolicies, secPolicy)
 					}
 					dm.SecurityPoliciesLock.Unlock()
-					dm.Logger.Printf("Detected a Security Policy (added/%s/%s)", secPolicy.Metadata["namespaceName"], secPolicy.Metadata["policyName"])
 
-					// apply security policies to pods
+					dm.Logger.Printf(
+						"Detected a Security Policy (added/%s/%s)",
+						secPolicy.Metadata["namespaceName"],
+						secPolicy.Metadata["policyName"],
+					)
+
 					dm.UpdateSecurityPolicy(addEvent, KubeArmorPolicy, secPolicy)
-
 				}
 			},
 			UpdateFunc: func(oldObj, newObj any) {
@@ -1792,17 +1813,21 @@ func (dm *KubeArmorDaemon) WatchSecurityPolicies() cache.InformerSynced {
 					}
 
 					dm.SecurityPoliciesLock.Lock()
-					for idx, policy := range dm.SecurityPolicies {
-						if policy.Metadata["namespaceName"] == secPolicy.Metadata["namespaceName"] && policy.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
+					for idx, p := range dm.SecurityPolicies {
+						if p.Metadata["namespaceName"] == secPolicy.Metadata["namespaceName"] &&
+							p.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
 							dm.SecurityPolicies[idx] = secPolicy
 							break
 						}
 					}
 					dm.SecurityPoliciesLock.Unlock()
 
-					dm.Logger.Printf("Detected a Security Policy (modified/%s/%s)", secPolicy.Metadata["namespaceName"], secPolicy.Metadata["policyName"])
+					dm.Logger.Printf(
+						"Detected a Security Policy (modified/%s/%s)",
+						secPolicy.Metadata["namespaceName"],
+						secPolicy.Metadata["policyName"],
+					)
 
-					// apply security policies to pods
 					dm.UpdateSecurityPolicy(updateEvent, KubeArmorPolicy, secPolicy)
 				}
 			},
@@ -1812,18 +1837,23 @@ func (dm *KubeArmorDaemon) WatchSecurityPolicies() cache.InformerSynced {
 					if err != nil {
 						return
 					}
+
 					dm.SecurityPoliciesLock.Lock()
-					for idx, policy := range dm.SecurityPolicies {
-						if policy.Metadata["namespaceName"] == secPolicy.Metadata["namespaceName"] && policy.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
+					for idx, p := range dm.SecurityPolicies {
+						if p.Metadata["namespaceName"] == secPolicy.Metadata["namespaceName"] &&
+							p.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
 							dm.SecurityPolicies = append(dm.SecurityPolicies[:idx], dm.SecurityPolicies[idx+1:]...)
 							break
 						}
 					}
 					dm.SecurityPoliciesLock.Unlock()
 
-					dm.Logger.Printf("Detected a Security Policy (deleted/%s/%s)", secPolicy.Metadata["namespaceName"], secPolicy.Metadata["policyName"])
+					dm.Logger.Printf(
+						"Detected a Security Policy (deleted/%s/%s)",
+						secPolicy.Metadata["namespaceName"],
+						secPolicy.Metadata["policyName"],
+					)
 
-					// apply security policies to pods
 					dm.UpdateSecurityPolicy(deleteEvent, KubeArmorPolicy, secPolicy)
 				}
 			},
@@ -1834,19 +1864,28 @@ func (dm *KubeArmorDaemon) WatchSecurityPolicies() cache.InformerSynced {
 		return nil
 	}
 
-	go factory.Start(StopChan)
+	// ==============================
+	//  FIX: Remove StopChan entirely
+	// ==============================
+	go func() {
+		factory.Start(ctx.Done())
+		factory.WaitForCacheSync(ctx.Done())
+	}()
+
 	return registration.HasSynced
 }
 
+
 // WatchClusterSecurityPolicies Function
-func (dm *KubeArmorDaemon) WatchClusterSecurityPolicies(timeout time.Duration) cache.InformerSynced {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func (dm *KubeArmorDaemon) WatchClusterSecurityPolicies(ctx context.Context, timeout time.Duration) cache.InformerSynced {
+	// time-bounded CRD wait using a child context of root ctx
+	initCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	crdFound := false
 	for !crdFound {
 		select {
-		case <-ctx.Done():
+		case <-initCtx.Done():
 			dm.Logger.Warn("timeout while monitoring cluster security policies, kubearmorclusterpolicies CRD not found")
 			return nil
 		default:
@@ -1864,7 +1903,6 @@ func (dm *KubeArmorDaemon) WatchClusterSecurityPolicies(timeout time.Duration) c
 	registration, err := informer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj any) {
-				// create a security policy
 				if policy, ok := obj.(*ksp.KubeArmorClusterPolicy); ok {
 
 					secPolicy, err := dm.CreateSecurityPolicy(KubeArmorClusterPolicy, *policy)
@@ -1874,8 +1912,8 @@ func (dm *KubeArmorDaemon) WatchClusterSecurityPolicies(timeout time.Duration) c
 					}
 					dm.SecurityPoliciesLock.Lock()
 					new := true
-					for _, policy := range dm.SecurityPolicies {
-						if policy.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
+					for _, p := range dm.SecurityPolicies {
+						if p.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
 							new = false
 							break
 						}
@@ -1884,11 +1922,10 @@ func (dm *KubeArmorDaemon) WatchClusterSecurityPolicies(timeout time.Duration) c
 						dm.SecurityPolicies = append(dm.SecurityPolicies, secPolicy)
 					}
 					dm.SecurityPoliciesLock.Unlock()
+
 					dm.Logger.Printf("Detected a Cluster Security Policy (added/%s)", secPolicy.Metadata["policyName"])
 
-					// apply security policies to pods
 					dm.UpdateSecurityPolicy(addEvent, KubeArmorClusterPolicy, secPolicy)
-
 				}
 			},
 			UpdateFunc: func(oldObj, newObj any) {
@@ -1899,8 +1936,8 @@ func (dm *KubeArmorDaemon) WatchClusterSecurityPolicies(timeout time.Duration) c
 					}
 
 					dm.SecurityPoliciesLock.Lock()
-					for idx, policy := range dm.SecurityPolicies {
-						if policy.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
+					for idx, p := range dm.SecurityPolicies {
+						if p.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
 							dm.SecurityPolicies[idx] = secPolicy
 							break
 						}
@@ -1909,7 +1946,6 @@ func (dm *KubeArmorDaemon) WatchClusterSecurityPolicies(timeout time.Duration) c
 
 					dm.Logger.Printf("Detected a Cluster Security Policy (modified/%s)", secPolicy.Metadata["policyName"])
 
-					// apply security policies to pods
 					dm.UpdateSecurityPolicy(updateEvent, KubeArmorClusterPolicy, secPolicy)
 				}
 			},
@@ -1920,8 +1956,8 @@ func (dm *KubeArmorDaemon) WatchClusterSecurityPolicies(timeout time.Duration) c
 						return
 					}
 					dm.SecurityPoliciesLock.Lock()
-					for idx, policy := range dm.SecurityPolicies {
-						if policy.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
+					for idx, p := range dm.SecurityPolicies {
+						if p.Metadata["policyName"] == secPolicy.Metadata["policyName"] {
 							dm.SecurityPolicies = append(dm.SecurityPolicies[:idx], dm.SecurityPolicies[idx+1:]...)
 							break
 						}
@@ -1930,18 +1966,25 @@ func (dm *KubeArmorDaemon) WatchClusterSecurityPolicies(timeout time.Duration) c
 
 					dm.Logger.Printf("Detected a Cluster Security Policy (deleted/%s)", secPolicy.Metadata["policyName"])
 
-					// apply security policies to pods
 					dm.UpdateSecurityPolicy(deleteEvent, KubeArmorClusterPolicy, secPolicy)
 				}
 			},
 		},
 	)
 	if err != nil {
-		dm.Logger.Err("Couldn't start watching KubeArmor Security Policies")
+		dm.Logger.Err("Couldn't start watching KubeArmor Cluster Security Policies")
 		return nil
 	}
 
-	go factory.Start(StopChan)
+	// ==============================
+	//  FIX: use ctx instead of StopChan
+	// ==============================
+	go func() {
+		factory.Start(ctx.Done())
+		factory.WaitForCacheSync(ctx.Done())
+		
+	}()
+
 	return registration.HasSynced
 }
 
@@ -2813,7 +2856,7 @@ func (dm *KubeArmorDaemon) UpdateGlobalPosture(posture tp.DefaultPosture) {
 }
 
 // WatchDefaultPosture Function
-func (dm *KubeArmorDaemon) WatchDefaultPosture() cache.InformerSynced {
+func (dm *KubeArmorDaemon) WatchDefaultPosture(ctx context.Context) cache.InformerSynced {
 	factory := informers.NewSharedInformerFactory(K8s.K8sClient, 0)
 	informer := factory.Core().V1().Namespaces().Informer()
 
@@ -2823,13 +2866,15 @@ func (dm *KubeArmorDaemon) WatchDefaultPosture() cache.InformerSynced {
 				fp, fa := validateDefaultPosture("kubearmor-file-posture", ns, cfg.GlobalCfg.DefaultFilePosture)
 				np, na := validateDefaultPosture("kubearmor-network-posture", ns, cfg.GlobalCfg.DefaultNetworkPosture)
 				cp, ca := validateDefaultPosture("kubearmor-capabilities-posture", ns, cfg.GlobalCfg.DefaultCapabilitiesPosture)
+
 				defaultPosture := tp.DefaultPosture{
 					FileAction:         fp,
 					NetworkAction:      np,
 					CapabilitiesAction: cp,
 				}
 				annotated := fa || na || ca
-				// Set Visibility to Global Default
+
+				// Global default visibility
 				visibility := tp.Visibility{
 					File:         dm.validateVisibility("file", cfg.GlobalCfg.Visibility),
 					Process:      dm.validateVisibility("process", cfg.GlobalCfg.Visibility),
@@ -2839,7 +2884,7 @@ func (dm *KubeArmorDaemon) WatchDefaultPosture() cache.InformerSynced {
 					IMA:          dm.validateVisibility("ima", cfg.GlobalCfg.Visibility),
 				}
 
-				// Set Visibility to Namespace Annotation if exists
+				// Override by namespace annotation if present
 				if ns.Annotations != nil && ns.Annotations[visibilityKey] != "" {
 					visibility = tp.Visibility{
 						File:         dm.validateVisibility("file", ns.Annotations[visibilityKey]),
@@ -2850,6 +2895,7 @@ func (dm *KubeArmorDaemon) WatchDefaultPosture() cache.InformerSynced {
 						IMA:          dm.validateVisibility("ima", ns.Annotations[visibilityKey]),
 					}
 				}
+
 				dm.UpdateDefaultPosture(addEvent, ns.Name, defaultPosture, annotated)
 				dm.UpdateVisibility(addEvent, ns.Name, visibility)
 			}
@@ -2859,13 +2905,14 @@ func (dm *KubeArmorDaemon) WatchDefaultPosture() cache.InformerSynced {
 				fp, fa := validateDefaultPosture("kubearmor-file-posture", ns, cfg.GlobalCfg.DefaultFilePosture)
 				np, na := validateDefaultPosture("kubearmor-network-posture", ns, cfg.GlobalCfg.DefaultNetworkPosture)
 				cp, ca := validateDefaultPosture("kubearmor-capabilities-posture", ns, cfg.GlobalCfg.DefaultCapabilitiesPosture)
+
 				defaultPosture := tp.DefaultPosture{
 					FileAction:         fp,
 					NetworkAction:      np,
 					CapabilitiesAction: cp,
 				}
 				annotated := fa || na || ca
-				// Set Visibility to Global Default
+
 				visibility := tp.Visibility{
 					File:         dm.validateVisibility("file", cfg.GlobalCfg.Visibility),
 					Process:      dm.validateVisibility("process", cfg.GlobalCfg.Visibility),
@@ -2875,7 +2922,6 @@ func (dm *KubeArmorDaemon) WatchDefaultPosture() cache.InformerSynced {
 					IMA:          dm.validateVisibility("ima", cfg.GlobalCfg.Visibility),
 				}
 
-				// Set Visibility to Namespace Annotation if exists
 				if ns.Annotations != nil && ns.Annotations[visibilityKey] != "" {
 					visibility = tp.Visibility{
 						File:         dm.validateVisibility("file", ns.Annotations[visibilityKey]),
@@ -2886,9 +2932,9 @@ func (dm *KubeArmorDaemon) WatchDefaultPosture() cache.InformerSynced {
 						IMA:          dm.validateVisibility("ima", ns.Annotations[visibilityKey]),
 					}
 				}
+
 				dm.UpdateDefaultPosture(updateEvent, ns.Name, defaultPosture, annotated)
 				dm.UpdateVisibility(updateEvent, ns.Name, visibility)
-
 			}
 		},
 		DeleteFunc: func(obj any) {
@@ -2896,7 +2942,9 @@ func (dm *KubeArmorDaemon) WatchDefaultPosture() cache.InformerSynced {
 				_, fa := validateDefaultPosture("kubearmor-file-posture", ns, cfg.GlobalCfg.DefaultFilePosture)
 				_, na := validateDefaultPosture("kubearmor-network-posture", ns, cfg.GlobalCfg.DefaultNetworkPosture)
 				_, ca := validateDefaultPosture("kubearmor-capabilities-posture", ns, cfg.GlobalCfg.DefaultCapabilitiesPosture)
+
 				annotated := fa || na || ca
+
 				dm.UpdateDefaultPosture(deleteEvent, ns.Name, tp.DefaultPosture{}, annotated)
 				dm.UpdateVisibility(deleteEvent, ns.Name, tp.Visibility{})
 			}
@@ -2907,12 +2955,18 @@ func (dm *KubeArmorDaemon) WatchDefaultPosture() cache.InformerSynced {
 		return nil
 	}
 
-	go factory.Start(StopChan)
+	// context-based startup & shutdown
+	go func() {
+		factory.Start(ctx.Done())
+	    factory.WaitForCacheSync(ctx.Done())
+	}()
+
 	return registration.HasSynced
 }
 
+
 // WatchConfigMap function
-func (dm *KubeArmorDaemon) WatchConfigMap() cache.InformerSynced {
+func (dm *KubeArmorDaemon) WatchConfigMap(ctx context.Context) cache.InformerSynced {
 	configMapLabelOption := informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
 		opts.LabelSelector = fmt.Sprintf("kubearmor-app=%s", "kubearmor-configmap")
 	})
@@ -2928,12 +2982,15 @@ func (dm *KubeArmorDaemon) WatchConfigMap() cache.InformerSynced {
 				cfg.GlobalCfg.HostVisibility = cm.Data[cfg.ConfigHostVisibility]
 				cfg.GlobalCfg.Visibility = cm.Data[cfg.ConfigVisibility]
 				cfg.GlobalCfg.Cluster = cm.Data[cfg.ConfigCluster]
+
 				dm.NodeLock.Lock()
 				dm.Node.ClusterName = cm.Data[cfg.ConfigCluster]
 				dm.NodeLock.Unlock()
+
 				if _, ok := cm.Data[cfg.ConfigDefaultPostureLogs]; ok {
 					cfg.GlobalCfg.DefaultPostureLogs = (cm.Data[cfg.ConfigDefaultPostureLogs] == "true")
 				}
+
 				globalPosture := tp.DefaultPosture{
 					FileAction:         cm.Data[cfg.ConfigDefaultFilePosture],
 					NetworkAction:      cm.Data[cfg.ConfigDefaultNetworkPosture],
@@ -2946,6 +3003,7 @@ func (dm *KubeArmorDaemon) WatchConfigMap() cache.InformerSynced {
 					CapabilitiesAction: cfg.GlobalCfg.DefaultCapabilitiesPosture,
 					DeviceAction:       cfg.GlobalCfg.HostDefaultDevicePosture,
 				}
+
 				if _, ok := cm.Data[cfg.ConfigAlertThrottling]; ok {
 					cfg.GlobalCfg.AlertThrottling = (cm.Data[cfg.ConfigAlertThrottling] == "true")
 				}
@@ -2971,6 +3029,7 @@ func (dm *KubeArmorDaemon) WatchConfigMap() cache.InformerSynced {
 						cfg.GlobalCfg.EnableIMA = enableIMA
 					}
 				}
+
 				dm.UpdateIMA(cfg.GlobalCfg.EnableIMA)
 				dm.UpdateUSBDeviceHandler(cfg.GlobalCfg.USBDeviceHandler)
 				dm.SystemMonitor.UpdateThrottlingConfig()
@@ -2989,10 +3048,15 @@ func (dm *KubeArmorDaemon) WatchConfigMap() cache.InformerSynced {
 				cfg.GlobalCfg.HostVisibility = cm.Data[cfg.ConfigHostVisibility]
 				cfg.GlobalCfg.Visibility = cm.Data[cfg.ConfigVisibility]
 				cfg.GlobalCfg.Cluster = cm.Data[cfg.ConfigCluster]
+
+				dm.NodeLock.Lock()
 				dm.Node.ClusterName = cm.Data[cfg.ConfigCluster]
+				dm.NodeLock.Unlock()
+
 				if _, ok := cm.Data[cfg.ConfigDefaultPostureLogs]; ok {
 					cfg.GlobalCfg.DefaultPostureLogs = (cm.Data[cfg.ConfigDefaultPostureLogs] == "true")
 				}
+
 				globalPosture := tp.DefaultPosture{
 					FileAction:         cm.Data[cfg.ConfigDefaultFilePosture],
 					NetworkAction:      cm.Data[cfg.ConfigDefaultNetworkPosture],
@@ -3003,6 +3067,7 @@ func (dm *KubeArmorDaemon) WatchConfigMap() cache.InformerSynced {
 					NetworkAction:      cfg.GlobalCfg.DefaultNetworkPosture,
 					CapabilitiesAction: cfg.GlobalCfg.DefaultCapabilitiesPosture,
 				}
+
 				dm.Logger.Printf("Current Global Posture is %v", currentGlobalPosture)
 				dm.UpdateGlobalPosture(globalPosture)
 
@@ -3049,7 +3114,13 @@ func (dm *KubeArmorDaemon) WatchConfigMap() cache.InformerSynced {
 		return nil
 	}
 
-	go factory.Start(StopChan)
+	// context-based start/stop instead of StopChan
+	go func() {
+		factory.Start(ctx.Done())
+		factory.WaitForCacheSync(ctx.Done())
+
+	}()
+
 	return registration.HasSynced
 }
 

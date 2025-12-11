@@ -358,7 +358,7 @@ func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID,
 }
 
 // MonitorCrioEvents Function
-func (dm *KubeArmorDaemon) MonitorCrioEvents() {
+func (dm *KubeArmorDaemon) MonitorCrioEvents(ctx context.Context) {
 	dm.WgDaemon.Add(1)
 	defer dm.WgDaemon.Done()
 
@@ -373,7 +373,9 @@ func (dm *KubeArmorDaemon) MonitorCrioEvents() {
 
 	for {
 		select {
-		case <-StopChan:
+
+		case <-ctx.Done():
+			dm.Logger.Print("CRIO monitor exiting via context")
 			return
 
 		default:
@@ -390,7 +392,7 @@ func (dm *KubeArmorDaemon) MonitorCrioEvents() {
 			if len(newContainers) > 0 {
 				for containerID := range newContainers {
 					if err := dm.UpdateCrioContainer(context.Background(), containerID, "start"); err != nil {
-					kg.Warnf("Failed to update CRIO container %s: %s", containerID, err.Error())
+						kg.Warnf("Failed to update CRIO container %s: %s", containerID, err.Error())
 						invalidContainers = append(invalidContainers, containerID)
 					}
 				}

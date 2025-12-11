@@ -4,6 +4,7 @@
 package monitor
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -365,49 +366,61 @@ func cleanMaps(pidMap tp.PidMap, execLogMap map[uint32]tp.Log, execLogMapLock *s
 }
 
 // CleanUpExitedHostPids Function
-func (mon *SystemMonitor) CleanUpExitedHostPids() {
+func (mon *SystemMonitor) CleanUpExitedHostPids(ctx context.Context) {
 	ActiveHostPidMap := *(mon.ActiveHostPidMap)
 	ActivePidMapLock := *(mon.ActivePidMapLock)
 	MonitorLock := *(mon.MonitorLock)
 
+	// Run every 5 seconds (same cadence as before, but now cancellable via context).
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
 	for {
-		now := time.Now()
+		select {
+		case <-ctx.Done():
+			mon.Logger.Print("CleanUpExitedHostPids exiting due to context cancellation")
+			return
 
-		ActivePidMapLock.Lock()
+		case <-ticker.C:
+			now := time.Now()
 
-		for containerID, pidMap := range ActiveHostPidMap {
-			for pid, pidNode := range pidMap {
-				if pidNode.Exited && now.After(pidNode.ExitedTime.Add(time.Second*5)) {
-					cleanMaps(pidMap, mon.execLogMap, mon.execLogMapLock, pid)
-				} else if now.After(pidNode.ExitedTime.Add(time.Second * 30)) {
-					p, err := os.FindProcess(int(pid))
-					if err == nil && p != nil {
-						if p.Signal(syscall.Signal(0)) != nil {
+			// Clean up finished PIDs from ActiveHostPidMap.
+			ActivePidMapLock.Lock()
+			for containerID, pidMap := range ActiveHostPidMap {
+				for pid, pidNode := range pidMap {
+					// Short grace period if we already know the process has exited.
+					if pidNode.Exited && now.After(pidNode.ExitedTime.Add(5*time.Second)) {
+						cleanMaps(pidMap, mon.execLogMap, mon.execLogMapLock, pid)
+						continue
+					}
+
+					// Longer grace period to handle cases where "Exited" might not be set correctly.
+					if now.After(pidNode.ExitedTime.Add(30 * time.Second)) {
+						p, err := os.FindProcess(int(pid))
+						if err == nil && p != nil {
+							if p.Signal(syscall.Signal(0)) != nil {
+								cleanMaps(pidMap, mon.execLogMap, mon.execLogMapLock, pid)
+							}
+						} else {
 							cleanMaps(pidMap, mon.execLogMap, mon.execLogMapLock, pid)
 						}
-					} else {
-						cleanMaps(pidMap, mon.execLogMap, mon.execLogMapLock, pid)
 					}
 				}
+
+				if len(pidMap) == 0 {
+					delete(ActiveHostPidMap, containerID)
+				}
 			}
+			ActivePidMapLock.Unlock()
 
-			if len(pidMap) == 0 {
-				delete(ActiveHostPidMap, containerID)
+			// Clean up NsMap entries for containers that no longer exist.
+			MonitorLock.Lock()
+			for nsKey, cid := range mon.NsMap {
+				if _, ok := ActiveHostPidMap[cid]; !ok {
+					delete(mon.NsMap, nsKey)
+				}
 			}
+			MonitorLock.Unlock()
 		}
-
-		ActivePidMapLock.Unlock()
-
-		// read monitor status
-		MonitorLock.RLock()
-		monStatus := mon.Status
-		MonitorLock.RUnlock()
-
-		if !monStatus {
-			break
-		}
-
-		time.Sleep(10 * time.Second)
 	}
-
 }

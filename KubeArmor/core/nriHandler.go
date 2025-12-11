@@ -56,6 +56,7 @@ type NRIHandler struct {
 
 // NewNRIHandler creates a new NRIHandler with the given event callbacks.
 func (dm *KubeArmorDaemon) NewNRIHandler(
+	ctx context.Context,
 	handleDeletedContainer func(tp.Container),
 	handleNewContainer func(tp.Container),
 ) *NRIHandler {
@@ -65,12 +66,17 @@ func (dm *KubeArmorDaemon) NewNRIHandler(
 		stub.WithSocketPath(cfg.GlobalCfg.NRISocket),
 		stub.WithPluginIdx(cfg.GlobalCfg.NRIIndex),
 		stub.WithOnClose(func() {
+
+			if ctx.Err() != nil {
+				kg.Print("NRI stub closed after context cancellation, not restarting")
+				return
+			}
 			kg.Printf("restarting NRI")
-			nri.Start()
+			nri.Start(ctx)
 		}),
 	}
 
-	stub, err := stub.New(nri, opts...)
+	s, err := stub.New(nri, opts...)
 	if err != nil {
 		kg.Errf("Failed to create NRI stub: %s", err.Error())
 		return nil
@@ -78,7 +84,7 @@ func (dm *KubeArmorDaemon) NewNRIHandler(
 
 	nri.containers = map[string]tp.Container{}
 	nri.containersByNamespaces = map[namespaceKey]string{}
-	nri.stub = stub
+	nri.stub = s
 	nri.handleDeletedContainer = handleDeletedContainer
 	nri.handleNewContainer = handleNewContainer
 
@@ -86,9 +92,9 @@ func (dm *KubeArmorDaemon) NewNRIHandler(
 }
 
 // Start initiates a configured NRI connection.
-func (nh *NRIHandler) Start() {
+func (nh *NRIHandler) Start(ctx context.Context) {
 	go func() {
-		err := nh.stub.Run(context.Background())
+		err := nh.stub.Run(ctx)
 		if err != nil {
 			kg.Errf("Failed to connect to NRI: %s", err.Error())
 		}
@@ -308,7 +314,7 @@ func (nh *NRIHandler) nriToKubeArmorContainer(nriContainer *api.Container) tp.Co
 }
 
 // MonitorNRIEvents monitors NRI events.
-func (dm *KubeArmorDaemon) MonitorNRIEvents() {
+func (dm *KubeArmorDaemon) MonitorNRIEvents(ctx context.Context) {
 	dm.WgDaemon.Add(1)
 	defer dm.WgDaemon.Done()
 
@@ -433,14 +439,14 @@ func (dm *KubeArmorDaemon) MonitorNRIEvents() {
 		dm.Logger.Printf("Detected a container (removed/%.12s/pidns=%d/mntns=%d)", container.ContainerID, container.PidNS, container.MntNS)
 	}
 
-	NRI = dm.NewNRIHandler(handleDeletedContainer, handleNewContainer)
+	NRI = dm.NewNRIHandler(ctx, handleDeletedContainer, handleNewContainer)
 
 	// check if NRI exists
 	if NRI == nil {
 		return
 	}
 
-	NRI.Start()
+	NRI.Start(ctx)
 
 	dm.Logger.Print("Started to monitor NRI events")
 }

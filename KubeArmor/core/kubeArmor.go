@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2022 Authors of KubeArmor
 
-// Package core is responsible for initiating and maintaining interactions between external entities like K8s,CRIs and internal KubeArmor entities like eBPF Monitor and Log Feeders
+// Package core is responsible for initiating and maintaining interactions between
+// external entities like Kubernetes, CRIs and internal KubeArmor entities like
+// eBPF Monitor and Log Feeders.
 package core
 
 import (
@@ -42,14 +44,6 @@ import (
 // == KubeArmor Daemon == //
 // ====================== //
 
-// StopChan Channel
-var StopChan chan struct{}
-
-// init Function
-func init() {
-	StopChan = make(chan struct{})
-}
-
 // KubeArmorDaemon Structure
 type KubeArmorDaemon struct {
 	// node
@@ -63,7 +57,7 @@ type KubeArmorDaemon struct {
 	K8sPods     []tp.K8sPod
 	K8sPodsLock *sync.RWMutex
 
-	// containers (from docker)
+	// containers (from docker/CRI)
 	Containers     map[string]tp.Container
 	ContainersLock *sync.RWMutex
 
@@ -83,7 +77,7 @@ type KubeArmorDaemon struct {
 	HostSecurityPolicies     []tp.HostSecurityPolicy
 	HostSecurityPoliciesLock *sync.RWMutex
 
-	//DefaultPosture (namespace -> postures)
+	// DefaultPosture (namespace -> postures)
 	DefaultPostures     map[string]tp.DefaultPosture
 	DefaultPosturesLock *sync.Mutex
 
@@ -169,10 +163,7 @@ func NewKubeArmorDaemon() *KubeArmorDaemon {
 
 // DestroyKubeArmorDaemon Function
 func (dm *KubeArmorDaemon) DestroyKubeArmorDaemon() {
-	close(StopChan)
-
 	if dm.RuntimeEnforcer != nil {
-		// close runtime enforcer
 		if err := dm.CloseRuntimeEnforcer(); err != nil {
 			dm.Logger.Errf("Failed to stop KubeArmor Enforcer: %s", err.Error())
 		} else {
@@ -181,7 +172,6 @@ func (dm *KubeArmorDaemon) DestroyKubeArmorDaemon() {
 	}
 
 	if dm.SystemMonitor != nil {
-		// close system monitor
 		if err := dm.CloseSystemMonitor(); err != nil {
 			dm.Logger.Errf("Failed to stop KubeArmor Monitor: %s", err.Error())
 		} else {
@@ -190,7 +180,6 @@ func (dm *KubeArmorDaemon) DestroyKubeArmorDaemon() {
 	}
 
 	if dm.KVMAgent != nil {
-		// close kvm agent
 		if err := dm.CloseKVMAgent(); err != nil {
 			dm.Logger.Errf("Failed to stop KVM Agent: %s", err.Error())
 		} else {
@@ -199,7 +188,6 @@ func (dm *KubeArmorDaemon) DestroyKubeArmorDaemon() {
 	}
 
 	if dm.USBDeviceHandler != nil {
-		//close USB device handler
 		if dm.CloseUSBDeviceHandler() {
 			dm.Logger.Print("Stopped USB Device Handler")
 		}
@@ -212,7 +200,6 @@ func (dm *KubeArmorDaemon) DestroyKubeArmorDaemon() {
 	}
 
 	if dm.StateAgent != nil {
-		//go dm.StateAgent.PushNodeEvent(dm.Node, state.EventDeleted)
 		if err := dm.CloseStateAgent(); err != nil {
 			kg.Errf("Failed to destroy StateAgent: %s", err.Error())
 		} else {
@@ -220,11 +207,9 @@ func (dm *KubeArmorDaemon) DestroyKubeArmorDaemon() {
 		}
 	}
 
-	// wait for a while
 	time.Sleep(time.Second * 1)
 
 	if dm.Logger != nil {
-		// close logger
 		if err := dm.CloseLogger(); err != nil {
 			kg.Errf("Failed to stop KubeArmor Logger: %s", err.Error())
 		} else {
@@ -232,11 +217,9 @@ func (dm *KubeArmorDaemon) DestroyKubeArmorDaemon() {
 		}
 	}
 
-	// wait for other routines
 	kg.Print("Waiting for routine terminations")
 	dm.WgDaemon.Wait()
 
-	// delete pid file
 	if _, err := os.Stat(cfg.PIDFilePath); err == nil {
 		kg.Print("Deleting PID file")
 
@@ -282,7 +265,16 @@ func (dm *KubeArmorDaemon) CloseLogger() error {
 
 // InitSystemMonitor Function
 func (dm *KubeArmorDaemon) InitSystemMonitor() error {
-	dm.SystemMonitor = mon.NewSystemMonitor(&dm.Node, &dm.NodeLock, dm.Logger, &dm.Containers, &dm.ContainersLock, &dm.ActiveHostPidMap, &dm.ActivePidMapLock, &dm.MonitorLock)
+	dm.SystemMonitor = mon.NewSystemMonitor(
+		&dm.Node,
+		&dm.NodeLock,
+		dm.Logger,
+		&dm.Containers,
+		&dm.ContainersLock,
+		&dm.ActiveHostPidMap,
+		&dm.ActivePidMapLock,
+		&dm.MonitorLock,
+	)
 	if dm.SystemMonitor == nil {
 		return fmt.Errorf("failed to create new system monitor")
 	}
@@ -295,14 +287,14 @@ func (dm *KubeArmorDaemon) InitSystemMonitor() error {
 }
 
 // MonitorSystemEvents Function
-func (dm *KubeArmorDaemon) MonitorSystemEvents() {
+func (dm *KubeArmorDaemon) MonitorSystemEvents(ctx context.Context) {
 	dm.WgDaemon.Add(1)
 	defer dm.WgDaemon.Done()
 
 	if cfg.GlobalCfg.Policy || cfg.GlobalCfg.HostPolicy {
-		go dm.SystemMonitor.TraceSyscall()
-		go dm.SystemMonitor.UpdateLogs()
-		go dm.SystemMonitor.CleanUpExitedHostPids()
+		go dm.SystemMonitor.TraceSyscall(ctx)
+		go dm.SystemMonitor.UpdateLogs(ctx)
+		go dm.SystemMonitor.CleanUpExitedHostPids(ctx)
 	}
 }
 
@@ -430,12 +422,14 @@ func (dm *KubeArmorDaemon) CloseStateAgent() error {
 func GetOSSigChannel() chan os.Signal {
 	c := make(chan os.Signal, 1)
 
-	signal.Notify(c,
+	signal.Notify(
+		c,
 		syscall.SIGHUP,
 		syscall.SIGINT,
 		syscall.SIGTERM,
 		syscall.SIGQUIT,
-		os.Interrupt)
+		os.Interrupt,
+	)
 
 	return c
 }
@@ -443,6 +437,7 @@ func GetOSSigChannel() chan os.Signal {
 // =================== //
 // == Health Server == //
 // =================== //
+
 func (dm *KubeArmorDaemon) SetHealthStatus(serviceName string, healthStatus grpc_health_v1.HealthCheckResponse_ServingStatus) error {
 	if dm.GRPCHealthServer != nil {
 		dm.GRPCHealthServer.SetServingStatus(serviceName, healthStatus)
@@ -464,6 +459,7 @@ func KubeArmor() {
 
 	// create a daemon
 	dm := NewKubeArmorDaemon()
+
 	// Enable KubeArmorHostPolicy for both VM and KVMAgent and in non-k8s env
 	if cfg.GlobalCfg.KVMAgent || (!cfg.GlobalCfg.K8sEnv && cfg.GlobalCfg.HostPolicy) {
 
@@ -504,29 +500,22 @@ func KubeArmor() {
 		if err := K8s.InitK8sClient(); err != nil {
 			kg.Errf("Failed to initialize Kubernetes client: %v", err)
 
-			// destroy the daemon
 			dm.DestroyKubeArmorDaemon()
-
 			return
 		}
 
 		kg.Print("Initialized Kubernetes client")
 
-		// set the flag
 		dm.K8sEnabled = true
 
 		// watch k8s nodes
-		go dm.WatchK8sNodes()
+		go dm.WatchK8sNodes(rootCtx)
 		kg.Print("Started to monitor node events")
-
-		// == //
 
 		// wait for a while
 		time.Sleep(time.Second * 1)
 
 		for timeout := 0; timeout <= 60; timeout++ {
-
-			// read node information
 			dm.NodeLock.RLock()
 			nodeIP := dm.Node.NodeIP
 			dm.NodeLock.RUnlock()
@@ -538,22 +527,18 @@ func KubeArmor() {
 			if nodeIP == "" && timeout == 60 {
 				kg.Print("The node information is not available, terminating KubeArmor")
 
-				// destroy the daemon
 				dm.DestroyKubeArmorDaemon()
-
 				return
 			}
 
 			kg.Print("The node information is not available")
-
-			// wait for a while
 			time.Sleep(time.Second * 1)
 		}
 	}
 
 	protectedID := func(id, key string) string {
-		mac := hmac.New(sha256.New, []byte(id))
-		mac.Write([]byte(key))
+		mac := hmac.New(sha256.New, []byte(key))
+		mac.Write([]byte(id))
 		return hex.EncodeToString(mac.Sum(nil))
 	}
 
@@ -576,20 +561,15 @@ func KubeArmor() {
 		kg.Printf("Kubelet Version: %s", dm.Node.KubeletVersion)
 		kg.Printf("Container Runtime: %s", dm.Node.ContainerRuntimeVersion)
 	}
-	// == //
 
 	// initialize log feeder
 	if err := dm.InitLogger(); err != nil {
 		kg.Errf("Failed to initialize KubeArmor Logger: %v", err)
 
-		// destroy the daemon
 		dm.DestroyKubeArmorDaemon()
-
 		return
 	}
 	dm.Logger.Print("Initialized KubeArmor Logger")
-
-	// == //
 
 	// health server
 	if dm.Logger.LogServer != nil {
@@ -603,13 +583,10 @@ func KubeArmor() {
 		dm.Node.ClusterName = cfg.GlobalCfg.Cluster
 		dm.NodeLock.Unlock()
 
-		// initialize state agent
 		if err := dm.InitStateAgent(); err != nil {
 			dm.Logger.Errf("Failed to initialize State Agent Server: %s", err.Error())
 
-			// destroy the daemon
 			dm.DestroyKubeArmorDaemon()
-
 			return
 		}
 		dm.Logger.Print("Initialized State Agent Server")
@@ -624,26 +601,19 @@ func KubeArmor() {
 		go dm.StateAgent.PushNodeEvent(dm.Node, state.EventAdded)
 	}
 
-	// == //
-
 	// Containerized workloads with Host
 	if cfg.GlobalCfg.Policy || cfg.GlobalCfg.HostPolicy {
-		// initialize system monitor
 		if err := dm.InitSystemMonitor(); err != nil {
 			dm.Logger.Errf("Failed to initialize KubeArmor Monitor: %v", err)
 
-			// destroy the daemon
 			dm.DestroyKubeArmorDaemon()
-
 			return
 		}
 		dm.Logger.Print("Initialized KubeArmor Monitor")
 
-		// monitor system events
-		go dm.MonitorSystemEvents()
+		go dm.MonitorSystemEvents(rootCtx)
 		dm.Logger.Print("Started to monitor system events")
 
-		// initialize runtime enforcer
 		if err := dm.InitRuntimeEnforcer(dm.SystemMonitor.PinPath); err != nil {
 			dm.Logger.Printf("Disabled KubeArmor Enforcer: %s", err.Error())
 		} else {
@@ -658,7 +628,6 @@ func KubeArmor() {
 			}
 		}
 
-		// initialize presets
 		if err := dm.InitPresets(dm.Logger, dm.SystemMonitor); err != nil {
 			dm.Logger.Printf("Disabled Presets: %s", err.Error())
 		} else {
@@ -668,11 +637,12 @@ func KubeArmor() {
 
 	enableContainerPolicy := true
 
-	dm.SystemMonitor.Logger.ContainerNsKey = make(map[string]common.OuterKey)
+	if dm.SystemMonitor != nil {
+		dm.SystemMonitor.Logger.ContainerNsKey = make(map[string]common.OuterKey)
+	}
 
 	// Un-orchestrated workloads
 	if !dm.K8sEnabled && cfg.GlobalCfg.Policy {
-		// Check if cri socket set, if not then auto detect
 		if !cfg.GlobalCfg.UseOCIHooks {
 			if cfg.GlobalCfg.CRISocket == "" {
 				if kl.GetCRISocket("") == "" {
@@ -682,7 +652,6 @@ func KubeArmor() {
 					cfg.GlobalCfg.CRISocket = "unix://" + kl.GetCRISocket("")
 				}
 			} else {
-				// CRI socket supplied by user, check for existence
 				criSocketPath := strings.TrimPrefix(cfg.GlobalCfg.CRISocket, "unix://")
 				_, err := os.Stat(criSocketPath)
 				if err != nil {
@@ -695,26 +664,19 @@ func KubeArmor() {
 		if enableContainerPolicy {
 			dm.SetContainerNSVisibility()
 
-			// monitor containers
 			if strings.Contains(cfg.GlobalCfg.CRISocket, "docker") {
-				// update already deployed containers
 				dm.GetAlreadyDeployedDockerContainers()
-				// monitor docker events
 				go dm.MonitorDockerEvents(rootCtx)
 			} else if strings.Contains(cfg.GlobalCfg.CRISocket, "containerd") {
-				// insuring NRI monitoring only in case containerd is present
 				if cfg.GlobalCfg.NRIEnabled && dm.checkNRIAvailability() == nil {
-					// monitor NRI events
-					go dm.MonitorNRIEvents()
+					go dm.MonitorNRIEvents(rootCtx)
 				} else {
-					// monitor containerd events
 					go dm.MonitorContainerdEvents(rootCtx)
 				}
 			} else if strings.Contains(cfg.GlobalCfg.CRISocket, "cri-o") {
-				// monitor crio events
-				go dm.MonitorCrioEvents()
+				go dm.MonitorCrioEvents(rootCtx)
 			} else if cfg.GlobalCfg.UseOCIHooks {
-				go dm.ListenToNonK8sHook()
+				go dm.ListenToNonK8sHook(rootCtx)
 			} else {
 				enableContainerPolicy = false
 				dm.Logger.Warnf("Failed to monitor containers: %s is not a supported CRI socket.", cfg.GlobalCfg.CRISocket)
@@ -733,42 +695,34 @@ func KubeArmor() {
 		if cfg.GlobalCfg.UseOCIHooks &&
 			(strings.Contains(dm.Node.ContainerRuntimeVersion, "cri-o") ||
 				(strings.Contains(dm.Node.ContainerRuntimeVersion, "containerd") && dm.checkNRIAvailability() == nil)) {
-			go dm.ListenToK8sHook()
+			go dm.ListenToK8sHook(rootCtx)
 		} else if dm.checkNRIAvailability() == nil {
-			// monitor NRI events
-			go dm.MonitorNRIEvents()
-		} else if cfg.GlobalCfg.CRISocket != "" { // check if the CRI socket set while executing kubearmor exists
+			go dm.MonitorNRIEvents(rootCtx)
+		} else if cfg.GlobalCfg.CRISocket != "" {
 			trimmedSocket := strings.TrimPrefix(cfg.GlobalCfg.CRISocket, "unix://")
 			if _, err := os.Stat(trimmedSocket); err != nil {
 				dm.Logger.Warnf("Error while looking for CRI socket file: %s", err.Error())
 
-				// destroy the daemon
 				dm.DestroyKubeArmorDaemon()
 				return
 			}
 
-			// monitor containers
 			if strings.Contains(dm.Node.ContainerRuntimeVersion, "docker") || strings.Contains(cfg.GlobalCfg.CRISocket, "docker") {
-				// update already deployed containers
 				dm.GetAlreadyDeployedDockerContainers()
-				// monitor docker events
 				go dm.MonitorDockerEvents(rootCtx)
 			} else if strings.Contains(dm.Node.ContainerRuntimeVersion, "containerd") || strings.Contains(cfg.GlobalCfg.CRISocket, "containerd") {
-				// monitor containerd events
 				go dm.MonitorContainerdEvents(rootCtx)
 			} else if strings.Contains(dm.Node.ContainerRuntimeVersion, "cri-o") || strings.Contains(cfg.GlobalCfg.CRISocket, "cri-o") {
-				// monitor crio events
-				go dm.MonitorCrioEvents()
+				go dm.MonitorCrioEvents(rootCtx)
 			} else {
 				dm.Logger.Errf("Failed to monitor containers: %s is not a supported CRI socket.", cfg.GlobalCfg.CRISocket)
-				// destroy the daemon
 				dm.DestroyKubeArmorDaemon()
 				return
 			}
 
 			dm.Logger.Printf("Using %s for monitoring containers", cfg.GlobalCfg.CRISocket)
 
-		} else { // CRI socket not set, we'll have to auto detect
+		} else {
 			dm.Logger.Print("CRI socket not set. Trying to detect.")
 
 			if strings.HasPrefix(dm.Node.ContainerRuntimeVersion, "docker") {
@@ -777,87 +731,62 @@ func KubeArmor() {
 				if socketFile != "" {
 					cfg.GlobalCfg.CRISocket = "unix://" + socketFile
 
-					// update already deployed containers
 					dm.GetAlreadyDeployedDockerContainers()
-
-					// monitor docker events
 					go dm.MonitorDockerEvents(rootCtx)
 				} else {
-					// we might have to use containerd's socket as docker's socket is not
-					// available
 					socketFile := kl.GetCRISocket("containerd")
 
 					if socketFile != "" {
 						cfg.GlobalCfg.CRISocket = "unix://" + socketFile
-
-						// monitor containerd events
 						go dm.MonitorContainerdEvents(rootCtx)
 					} else {
 						dm.Logger.Err("Failed to monitor containers (Docker socket file is not accessible)")
 
-						// destroy the daemon
 						dm.DestroyKubeArmorDaemon()
-
 						return
 					}
 				}
-			} else if strings.HasPrefix(dm.Node.ContainerRuntimeVersion, "containerd") { // containerd
+			} else if strings.HasPrefix(dm.Node.ContainerRuntimeVersion, "containerd") {
 				socketFile := kl.GetCRISocket("containerd")
 
 				if socketFile != "" {
 					cfg.GlobalCfg.CRISocket = "unix://" + socketFile
-
-					// monitor containerd events
 					go dm.MonitorContainerdEvents(rootCtx)
 				} else {
 					dm.Logger.Err("Failed to monitor containers (Containerd socket file is not accessible)")
 
-					// destroy the daemon
 					dm.DestroyKubeArmorDaemon()
-
 					return
 				}
-			} else if strings.HasPrefix(dm.Node.ContainerRuntimeVersion, "cri-o") { // cri-o
+			} else if strings.HasPrefix(dm.Node.ContainerRuntimeVersion, "cri-o") {
 				socketFile := kl.GetCRISocket("cri-o")
 
 				if socketFile != "" {
 					cfg.GlobalCfg.CRISocket = "unix://" + socketFile
-
-					// monitor cri-o events
-					go dm.MonitorCrioEvents()
+					go dm.MonitorCrioEvents(rootCtx)
 				} else {
 					dm.Logger.Err("Failed to monitor containers (CRI-O socket file is not accessible)")
 
-					// destroy the daemon
 					dm.DestroyKubeArmorDaemon()
-
 					return
 				}
 			}
 		}
 	}
 
-	// == //
-
 	// wait for a while
 	time.Sleep(time.Second * 1)
-
-	// == //
 
 	// Init USB Device Handler
 	if cfg.GlobalCfg.HostPolicy && cfg.GlobalCfg.USBDeviceHandler {
 		if !dm.InitUSBDeviceHandler() {
 			dm.Logger.Warn("Failed to initialize KubeArmor USB Device Handler")
 
-			// destroy the daemon
 			dm.DestroyKubeArmorDaemon()
-
 			return
 		}
 		dm.Logger.Print("Initialized KubeArmor USB Device Handler")
 	}
-
-	// == //
 
 	timeout, err := time.ParseDuration(cfg.GlobalCfg.InitTimeout)
 	if dm.K8sEnabled && cfg.GlobalCfg.Policy {
@@ -867,17 +796,15 @@ func KubeArmor() {
 		}
 
 		// watch security policies
-		securityPoliciesSynced := dm.WatchSecurityPolicies()
+		securityPoliciesSynced := dm.WatchSecurityPolicies(rootCtx)
 		if securityPoliciesSynced == nil {
-			// destroy the daemon
 			dm.DestroyKubeArmorDaemon()
-
 			return
 		}
 		dm.Logger.Print("Started to monitor security policies")
 
 		// watch cluster security policies
-		clusterSecurityPoliciesSynced := dm.WatchClusterSecurityPolicies(timeout)
+		clusterSecurityPoliciesSynced := dm.WatchClusterSecurityPolicies(rootCtx, timeout)
 		if clusterSecurityPoliciesSynced == nil {
 			dm.Logger.Warn("error while monitoring cluster security policies, informer cache not synced")
 		} else {
@@ -885,41 +812,35 @@ func KubeArmor() {
 		}
 
 		// watch default posture
-		defaultPostureSynced := dm.WatchDefaultPosture()
+		defaultPostureSynced := dm.WatchDefaultPosture(rootCtx)
 		if defaultPostureSynced == nil {
-			// destroy the daemon
 			dm.DestroyKubeArmorDaemon()
-
 			return
 		}
 		dm.Logger.Print("Started to monitor per-namespace default posture")
 
 		// watch kubearmor configmap
-		configMapSynced := dm.WatchConfigMap()
+		configMapSynced := dm.WatchConfigMap(rootCtx)
 		if configMapSynced == nil {
-			// destroy the daemon
 			dm.DestroyKubeArmorDaemon()
-
 			return
 		}
 		dm.Logger.Print("Watching for posture changes")
 
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
+		// separate context for informer cache sync
+		syncCtx, syncCancel := context.WithTimeout(rootCtx, timeout)
+		defer syncCancel()
 
-		synced := cache.WaitForCacheSync(ctx.Done(), securityPoliciesSynced, defaultPostureSynced, configMapSynced)
+		synced := cache.WaitForCacheSync(syncCtx.Done(), securityPoliciesSynced, defaultPostureSynced, configMapSynced)
 		if !synced {
 			dm.Logger.Err("Failed to sync Kubernetes informers")
 
-			// destroy the daemon
 			dm.DestroyKubeArmorDaemon()
-
 			return
 		}
 
-		// watch k8s pods (function never returns, must be called in a
-		// goroutine)
-		go dm.WatchK8sPods()
+		// watch k8s pods (function never returns, must be called in a goroutine)
+		go dm.WatchK8sPods(rootCtx)
 		dm.Logger.Print("Started to monitor Pod events")
 	}
 
@@ -944,7 +865,7 @@ func KubeArmor() {
 		}
 		pb.RegisterPolicyServiceServer(dm.Logger.LogServer, policyService)
 
-		//Enable grpc service to send kubearmor data to client in unorchestrated mode
+		// Enable grpc service to send kubearmor data to client in unorchestrated mode
 		probe := &Probe{}
 		probe.GetContainerData = dm.SetProbeContainerData
 		pb.RegisterProbeServiceServer(dm.Logger.LogServer, probe)
@@ -957,7 +878,7 @@ func KubeArmor() {
 		}
 	}
 
-	reflection.Register(dm.Logger.LogServer) // Helps grpc clients list out what all svc/endpoints available
+	reflection.Register(dm.Logger.LogServer)
 
 	// serve log feeds
 	go dm.ServeLogFeeds()
@@ -966,36 +887,27 @@ func KubeArmor() {
 		dm.Logger.Warnf("Failed to set health status for LogService: %v", err)
 	}
 
-	// == //
 	go dm.SetKarmorData()
 	dm.Logger.Print("Initialized KubeArmor")
-	// == //
 
 	if cfg.GlobalCfg.KVMAgent || !dm.K8sEnabled {
 		// Restore and apply all kubearmor host security policies
 		dm.restoreKubeArmorPolicies()
 	}
-	// == //
 
 	// Init KvmAgent
 	if cfg.GlobalCfg.KVMAgent {
-		// initialize kvm agent
 		if err := dm.InitKVMAgent(); err != nil {
 			dm.Logger.Errf("Failed to initialize KVM Agent: %s", err.Error())
 
-			// destroy the daemon
 			dm.DestroyKubeArmorDaemon()
-
 			return
 		}
 		dm.Logger.Print("Initialized KVM Agent")
 
-		// connect to KVM Service
 		go dm.ConnectToKVMService()
 		dm.Logger.Print("Started to keep the connection to KVM Service")
 	}
-
-	// == //
 
 	if !cfg.GlobalCfg.CoverageTest {
 		// listen for interrupt signals
@@ -1004,20 +916,20 @@ func KubeArmor() {
 		go func() {
 			<-sigChan
 			dm.Logger.Print("Got a signal to terminate KubeArmor")
-			// cancel root context, saare goroutines ko shutdown signal milega
+			// cancel root context so all goroutines can exit cleanly
 			rootCancel()
 		}()
 
-		// wait until context cancelled (signal, ya future me agar kahin aur se cancel hua)
+		// wait until root context is cancelled
 		<-rootCtx.Done()
 	}
 
-	// destroy the daemon
 	dm.DestroyKubeArmorDaemon()
 }
 
+// checkNRIAvailability verifies the presence of an NRI socket.
 func (dm *KubeArmorDaemon) checkNRIAvailability() error {
-	// Check if nri socket is set, if not then auto detect
+	// Check if NRI socket is set, if not then auto detect
 	if cfg.GlobalCfg.NRISocket == "" {
 		if kl.GetNRISocket("") != "" {
 			cfg.GlobalCfg.NRISocket = kl.GetNRISocket("")

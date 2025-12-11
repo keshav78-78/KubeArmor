@@ -612,9 +612,6 @@ func (dm *KubeArmorDaemon) MonitorContainerdEvents(ctx context.Context) {
 			 dm.Logger.Print("Stopping containerd events monitor via context")
         return
 		
-		case <-StopChan:
-			return
-
 		case envelope := <-Containerd.k8sEventsCh:
 			dm.handleContainerdEvent(envelope, Containerd.containerd)
 

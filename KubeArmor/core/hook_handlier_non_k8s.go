@@ -5,6 +5,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +25,10 @@ import (
 
 // ListenToNonK8sHook starts listening on a UNIX socket and waits for container hooks
 // to pass new containers
-func (dm *KubeArmorDaemon) ListenToNonK8sHook() {
+func (dm *KubeArmorDaemon) ListenToNonK8sHook(ctx context.Context) {
+	dm.WgDaemon.Add(1)
+	defer dm.WgDaemon.Done()
+
 	dm.Logger.Print("Started to monitor non k8s hook events")
 
 	if err := os.MkdirAll(kubearmorDir, 0750); err != nil {
@@ -32,7 +36,7 @@ func (dm *KubeArmorDaemon) ListenToNonK8sHook() {
 	}
 
 	listenPath := filepath.Join(kubearmorDir, "ka.sock")
-	err := os.Remove(listenPath) // in case kubearmor crashed and the socket wasn't removed (cleaning the socket file if got crashed)
+	err := os.Remove(listenPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		dm.Logger.Warnf("Failed to cleanup ka.sock: %v", err)
 	}
@@ -43,7 +47,13 @@ func (dm *KubeArmorDaemon) ListenToNonK8sHook() {
 		return
 	}
 
-	// #nosec G302 Set the permissions of ka.sock to 777 so that rootless podman with user level priviledges can also communicate with the socket
+	// unblock Accept when ctx is cancelled
+	go func() {
+		<-ctx.Done()
+		dm.Logger.Print("Non-K8s hook listener: context cancelled, closing socket")
+		_ = socket.Close()
+	}()
+
 	if err := os.Chmod(listenPath, 0777); err != nil {
 		dm.Logger.Warnf("Failed to set permissions on %s: %v", listenPath, err)
 	}
@@ -55,12 +65,16 @@ func (dm *KubeArmorDaemon) ListenToNonK8sHook() {
 	for {
 		conn, err := socket.Accept()
 		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				dm.Logger.Print("Non-K8s hook listener exiting due to context")
+				return
+			}
 			dm.Logger.Warnf("Error accepting socket connection: %v", err)
-		} else {
-			go dm.handleNonK8sConn(conn, ready)
+			continue
 		}
-	}
 
+		go dm.handleNonK8sConn(conn, ready)
+	}
 }
 
 // handleNonK8sConn gets container details from container hooks.
